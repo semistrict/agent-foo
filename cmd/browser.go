@@ -135,6 +135,14 @@ func printHuman(action string, data json.RawMessage) {
 			fmt.Printf("%s — %s\n", m["title"], m["url"])
 			return
 		}
+	case "close-tab":
+		var tabs []map[string]string
+		if json.Unmarshal(data, &tabs) == nil {
+			for _, t := range tabs {
+				fmt.Printf("Closed %s: %s — %s\n", t["index"], t["title"], t["url"])
+			}
+			return
+		}
 	case "events":
 		var events []map[string]any
 		if json.Unmarshal(data, &events) == nil {
@@ -280,6 +288,9 @@ var screenshotCmd = &cobra.Command{
 		}
 		if flagFull {
 			p["full"] = "true"
+		}
+		if v, _ := cmd.Flags().GetBool("refs"); v {
+			p["refs"] = "true"
 		}
 		return send("screenshot", p)
 	},
@@ -463,6 +474,23 @@ var tabCmd = &cobra.Command{
 	},
 }
 
+var textCmd = &cobra.Command{
+	Use:   "text",
+	Short: "Page content as Markdown",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return send("text", nil)
+	},
+}
+
+var closeTabCmd = &cobra.Command{
+	Use:   "close-tab <indexes>",
+	Short: "Close tabs by index (e.g. 1, 0,2,4, 1-3, 0,2-5)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return send("close-tab", map[string]string{"indexes": args[0]})
+	},
+}
+
 var closeCmd = &cobra.Command{
 	Use:   "close",
 	Short: "Close browser and stop daemon",
@@ -515,6 +543,7 @@ func init() {
 	browserCmd.PersistentFlags().IntVar(&flagTimeout, "timeout", 0, "Command timeout in seconds (default: 5)")
 
 	screenshotCmd.Flags().BoolVarP(&flagFull, "full", "f", false, "Full page screenshot")
+	screenshotCmd.Flags().Bool("refs", false, "Annotate interactive elements with @ref labels")
 	renderCmd.Flags().IntP("width", "W", 0, "Grid width in columns (default: terminal width)")
 	renderCmd.Flags().IntP("height", "H", 0, "Grid height in rows (default: terminal height)")
 	eventsCmd.Flags().String("category", "", "Filter by category (console, network, page, target)")
@@ -528,9 +557,9 @@ func init() {
 
 	browserCmd.AddCommand(
 		openCmd, clickCmd, typeCmd, fillCmd, pressCmd,
-		screenshotCmd, renderCmd, pdfCmd, snapshotCmd, evalCmd, waitCmd,
+		screenshotCmd, renderCmd, textCmd, pdfCmd, snapshotCmd, evalCmd, waitCmd,
 		backCmd, forwardCmd, reloadCmd,
-		uploadCmd, setCmd, eventsCmd, tabsCmd, tabCmd, closeCmd, sessionCmd,
+		uploadCmd, setCmd, eventsCmd, tabsCmd, tabCmd, closeTabCmd, closeCmd, sessionCmd,
 	)
 	rootCmd.AddCommand(browserCmd)
 }

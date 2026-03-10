@@ -25,7 +25,8 @@ type Tab struct {
 
 // Instance holds a long-lived chromedp browser context.
 type Instance struct {
-	Ctx         context.Context
+	Ctx         context.Context // active tab's context (used for actions)
+	BrowserCtx  context.Context // root browser context (used for creating tabs)
 	Events      *EventBuffer
 	allocCancel context.CancelFunc
 	ctxCancel   context.CancelFunc
@@ -82,7 +83,7 @@ func Launch(opts LaunchOptions) (*Instance, error) {
 	if opts.CDPUrl != "" {
 		allocCtx, allocCancel := chromedp.NewRemoteAllocator(context.Background(), opts.CDPUrl)
 		ctx, cancel := chromedp.NewContext(allocCtx)
-		inst := &Instance{Ctx: ctx, Events: events, allocCancel: allocCancel, ctxCancel: cancel}
+		inst := &Instance{Ctx: ctx, BrowserCtx: ctx, Events: events, allocCancel: allocCancel, ctxCancel: cancel}
 		// Need to run something to initialize the target before listening
 		chromedp.Run(ctx)
 		StartListening(ctx, events)
@@ -108,7 +109,7 @@ func Launch(opts LaunchOptions) (*Instance, error) {
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), allocOpts...)
 	ctx, cancel := chromedp.NewContext(allocCtx)
 
-	inst := &Instance{Ctx: ctx, Events: events, allocCancel: allocCancel, ctxCancel: cancel}
+	inst := &Instance{Ctx: ctx, BrowserCtx: ctx, Events: events, allocCancel: allocCancel, ctxCancel: cancel}
 	// Initialize browser, enable network + runtime domains, then listen
 	chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
 		network.Enable().Do(ctx)

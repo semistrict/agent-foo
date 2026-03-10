@@ -2,9 +2,11 @@ package browser
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +18,9 @@ import (
 
 	"github.com/semistrict/agent-foo/internal/protocol"
 )
+
+//go:embed js/refs_overlay.js
+var refsOverlayJS string
 
 // Handler manages a long-lived browser and processes commands.
 type Handler struct {
@@ -118,10 +123,14 @@ func (h *Handler) dispatch(req *protocol.Request) *protocol.Response {
 		return h.doDebug(p)
 	case "render":
 		return h.doRender(p)
+	case "text":
+		return h.doText(p)
 	case "tabs":
 		return h.doTabs(p)
 	case "tab":
 		return h.doTab(p)
+	case "close-tab":
+		return h.doCloseTab(p)
 	default:
 		return errResp("unknown action: %s", req.Action)
 	}
@@ -226,8 +235,8 @@ func (h *Handler) doOpen(p paramMap) *protocol.Response {
 		url = "https://" + url
 	}
 
-	// Create a new tab in the existing browser
-	tabCtx, tabCancel := chromedp.NewContext(h.browser.Ctx)
+	// Create a new tab as a sibling (from root browser context, not current tab)
+	tabCtx, tabCancel := chromedp.NewContext(h.browser.BrowserCtx)
 
 	// Navigate in the new tab (this also initializes the target)
 	if err := chromedp.Run(tabCtx, chromedp.Navigate(url)); err != nil {
@@ -237,6 +246,9 @@ func (h *Handler) doOpen(p paramMap) *protocol.Response {
 
 	var title string
 	chromedp.Run(tabCtx, chromedp.Title(&title))
+
+	// Listen for events on the new tab's target
+	StartListening(tabCtx, h.browser.Events)
 
 	// Track the tab and make it active
 	tab := &Tab{Ctx: tabCtx, Cancel: tabCancel, URL: url, Title: title}
@@ -283,6 +295,90 @@ func (h *Handler) doTab(p paramMap) *protocol.Response {
 	return dataResp(map[string]string{"url": tab.URL, "title": tab.Title})
 }
 
+// parseIndexes parses a string like "0,2-5,7" into a sorted, deduplicated slice of ints.
+func parseIndexes(s string, max int) ([]int, error) {
+	seen := make(map[int]bool)
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if strings.Contains(part, "-") {
+			bounds := strings.SplitN(part, "-", 2)
+			lo, err := strconv.Atoi(strings.TrimSpace(bounds[0]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid index: %s", bounds[0])
+			}
+			hi, err := strconv.Atoi(strings.TrimSpace(bounds[1]))
+			if err != nil {
+				return nil, fmt.Errorf("invalid index: %s", bounds[1])
+			}
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			for i := lo; i <= hi; i++ {
+				if i < 0 || i >= max {
+					return nil, fmt.Errorf("tab index out of range: %d (have %d tabs)", i, max)
+				}
+				seen[i] = true
+			}
+		} else {
+			idx, err := strconv.Atoi(part)
+			if err != nil {
+				return nil, fmt.Errorf("invalid index: %s", part)
+			}
+			if idx < 0 || idx >= max {
+				return nil, fmt.Errorf("tab index out of range: %d (have %d tabs)", idx, max)
+			}
+			seen[idx] = true
+		}
+	}
+	// Sort descending so we can remove from the end first
+	idxs := make([]int, 0, len(seen))
+	for i := range seen {
+		idxs = append(idxs, i)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(idxs)))
+	return idxs, nil
+}
+
+func (h *Handler) doCloseTab(p paramMap) *protocol.Response {
+	spec := p.get("indexes")
+	if spec == "" {
+		// Fall back to single "index" param
+		spec = p.get("index")
+	}
+	if spec == "" {
+		return errResp("indexes is required")
+	}
+
+	idxs, err := parseIndexes(spec, len(h.browser.Tabs))
+	if err != nil {
+		return errResp("%v", err)
+	}
+	if len(idxs) >= len(h.browser.Tabs) {
+		return errResp("cannot close all tabs")
+	}
+
+	var closed []map[string]string
+	// Indexes are sorted descending, so removing from the end keeps earlier indexes stable
+	for _, idx := range idxs {
+		tab := h.browser.Tabs[idx]
+		closed = append(closed, map[string]string{
+			"index": fmt.Sprintf("%d", idx),
+			"title": tab.Title,
+			"url":   tab.URL,
+		})
+		tab.Cancel()
+		h.browser.Tabs = append(h.browser.Tabs[:idx], h.browser.Tabs[idx+1:]...)
+	}
+
+	// Adjust active tab
+	if h.browser.ActiveTab >= len(h.browser.Tabs) {
+		h.browser.ActiveTab = len(h.browser.Tabs) - 1
+	}
+	h.browser.Ctx = h.browser.Tabs[h.browser.ActiveTab].Ctx
+
+	return dataResp(closed)
+}
+
 func (h *Handler) doClick(p paramMap) *protocol.Response {
 	return h.runAndCheck(chromedp.Click(p.sel("selector"), chromedp.ByQuery))
 }
@@ -300,7 +396,7 @@ func (h *Handler) doFill(p paramMap) *protocol.Response {
 }
 
 func (h *Handler) doPress(p paramMap) *protocol.Response {
-	return h.runAndCheck(chromedp.KeyEvent(p.get("key")))
+	return h.runAndCheck(parseBrowserKey(p.get("key")))
 }
 
 func (h *Handler) doScreenshot(p paramMap) *protocol.Response {
@@ -309,6 +405,19 @@ func (h *Handler) doScreenshot(p paramMap) *protocol.Response {
 		path = "screenshot.png"
 	}
 	full := p.get("full") == "true"
+	refs := p.get("refs") == "true"
+
+	// If refs requested, run snapshot first to assign data-ref attributes, then add overlay
+	if refs {
+		_, err := Snapshot(h.browser.Ctx, SnapshotOptions{})
+		if err != nil {
+			return errResp("snapshot for refs: %v", err)
+		}
+		if err := h.browser.Run(chromedp.Evaluate(refsOverlayJS, nil)); err != nil {
+			return errResp("inject refs overlay: %v", err)
+		}
+	}
+
 	var buf []byte
 	var err error
 	if full {
@@ -316,6 +425,12 @@ func (h *Handler) doScreenshot(p paramMap) *protocol.Response {
 	} else {
 		err = h.browser.Run(chromedp.CaptureScreenshot(&buf))
 	}
+
+	// Remove overlay after screenshot
+	if refs {
+		h.browser.Run(chromedp.Evaluate(`(() => { const el = document.getElementById('__af_refs_overlay__'); if (el) el.remove(); })()`, nil))
+	}
+
 	if err != nil {
 		return errResp("%v", err)
 	}
