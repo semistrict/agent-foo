@@ -284,8 +284,12 @@ var runCmd = &cobra.Command{
 
 		// Start the command
 		argsJSON, _ := json.Marshal(remaining)
+		cwd, _ := os.Getwd()
+		envJSON, _ := json.Marshal(os.Environ())
 		p := map[string]string{
 			"args": string(argsJSON),
+			"cwd":  cwd,
+			"env":  string(envJSON),
 		}
 		if label != "" {
 			p["label"] = label

@@ -137,7 +137,18 @@ func (h *Handler) doRun(p paramMap) *protocol.Response {
 	h.mu.Unlock()
 
 	cmd := exec.Command(args[0], args[1:]...)
-	for _, e := range os.Environ() {
+	if cwd := p["cwd"]; cwd != "" {
+		cmd.Dir = cwd
+	}
+	// Use client's environment if provided, otherwise fall back to daemon's
+	var environ []string
+	if envRaw := p["env"]; envRaw != "" {
+		json.Unmarshal([]byte(envRaw), &environ)
+	}
+	if len(environ) == 0 {
+		environ = os.Environ()
+	}
+	for _, e := range environ {
 		if !strings.HasPrefix(e, "CLAUDECODE=") {
 			cmd.Env = append(cmd.Env, e)
 		}
