@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head><title>Debug Test</title></head>
+<body>
+<h1>Debug Test</h1>
+<button id="btn" onclick="run()">Run</button>
+<div id="output"></div>
+<script>
+function add(a, b) {
+  var sum = a + b;
+  return sum;
+}
+
+function run() {
+  var x = 10;
+  var y = 20;
+  var result = add(x, y);
+  document.getElementById('output').textContent = 'Result: ' + result;
+}
+</script>
+</body>
+</html>

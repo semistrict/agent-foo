@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head><title>Form Test Page</title></head>
+<body>
+  <h1>Form Test</h1>
+  <form id="test-form" onsubmit="event.preventDefault(); document.getElementById('result').textContent = 'Submitted: ' + document.getElementById('name-input').value">
+    <label for="name-input">Name</label>
+    <input id="name-input" type="text" placeholder="Enter your name">
+
+    <label for="email-input">Email</label>
+    <input id="email-input" type="email" placeholder="Enter your email">
+
+    <label for="color-select">Color</label>
+    <select id="color-select">
+      <option value="red">Red</option>
+      <option value="green">Green</option>
+      <option value="blue">Blue</option>
+    </select>
+
+    <label for="agree-checkbox">I agree</label>
+    <input id="agree-checkbox" type="checkbox">
+
+    <button type="submit" id="submit-btn">Submit</button>
+  </form>
+  <div id="result"></div>
+</body>
+</html>

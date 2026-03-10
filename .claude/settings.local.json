@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go get:*)",
+      "Bash(make build:*)",
+      "Bash(./bin/af browser:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(go doc:*)",
+      "Bash(tmux new-session:*)",
+      "Bash(tmux send-keys:*)"
+    ],
+    "additionalDirectories": [
+      "/Users/ramon/src"
+    ]
+  }
+}
