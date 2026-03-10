@@ -74,6 +74,11 @@ func af(args ...string) (string, error) {
 				fullArgs = append(fullArgs, args[:i+1]...)
 				fullArgs = append(fullArgs, "--session", testSession)
 				fullArgs = append(fullArgs, args[i+1:]...)
+			case "debug":
+				// Insert --session after "debug"
+				fullArgs = append(fullArgs, args[:i+1]...)
+				fullArgs = append(fullArgs, "--session", testSession)
+				fullArgs = append(fullArgs, args[i+1:]...)
 			case "stop":
 				// stop has its own --session flag
 				fullArgs = args

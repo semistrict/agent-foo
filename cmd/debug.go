@@ -3,6 +3,8 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
@@ -60,7 +62,24 @@ func printDebugHuman(action string, data json.RawMessage) {
 	case "launch", "attach":
 		var m map[string]any
 		if json.Unmarshal(data, &m) == nil {
-			fmt.Printf("Debug session %s: %s\n", m["label"], m["status"])
+			if m["status"] == "stopped" {
+				fmt.Printf("Stopped: %s (thread %v)\n", m["reason"], m["threadId"])
+				if frames, ok := m["stackTrace"].([]any); ok {
+					for i, f := range frames {
+						fm, _ := f.(map[string]any)
+						if fm == nil {
+							continue
+						}
+						file := fm["file"]
+						if file == nil {
+							file = "<unknown>"
+						}
+						fmt.Printf("  #%-2d %s at %s:%v\n", i, fm["name"], file, fm["line"])
+					}
+				}
+			} else {
+				fmt.Printf("Debug session %s: %s\n", m["label"], m["status"])
+			}
 			return
 		}
 	case "breakpoint":
@@ -96,6 +115,8 @@ func printDebugHuman(action string, data json.RawMessage) {
 						fmt.Printf("  #%-2d %s at %s:%v\n", i, fm["name"], file, fm["line"])
 					}
 				}
+			} else if m["status"] == "exited" {
+				fmt.Printf("Exited with code %v\n", m["exitCode"])
 			} else {
 				fmt.Println("OK")
 			}
@@ -197,13 +218,39 @@ func printDebugHuman(action string, data json.RawMessage) {
 var debugCmd = &cobra.Command{
 	Use:   "debug",
 	Short: "Debug adapter protocol (DAP) sessions",
+	// "af debug <program>" is a shorthand for "af debug launch <program>"
+	Args: cobra.ArbitraryArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 1 {
+			// Only treat as program shorthand if the file exists
+			program, err := filepath.Abs(args[0])
+			if err != nil {
+				return err
+			}
+			if _, err := os.Stat(program); err != nil {
+				return fmt.Errorf("unknown command %q for \"af debug\"", args[0])
+			}
+			return sendDebug("launch", map[string]string{
+				"program":     program,
+				"stopOnEntry": "true",
+			})
+		}
+		return cmd.Help()
+	},
 }
 
 var debugLaunchCmd = &cobra.Command{
-	Use:   "launch",
+	Use:   "launch <program>",
 	Short: "Launch a debug adapter and start debugging",
+	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		p := map[string]string{}
+		program, err := filepath.Abs(args[0])
+		if err != nil {
+			return err
+		}
+		p := map[string]string{
+			"program": program,
+		}
 		if v, _ := cmd.Flags().GetString("label"); v != "" {
 			p["label"] = v
 		}
@@ -213,16 +260,14 @@ var debugLaunchCmd = &cobra.Command{
 		if v, _ := cmd.Flags().GetString("port"); v != "" {
 			p["port"] = v
 		}
-		if v, _ := cmd.Flags().GetString("program"); v != "" {
-			p["program"] = v
-		}
 		if v, _ := cmd.Flags().GetString("cwd"); v != "" {
 			p["cwd"] = v
 		}
 		if v, _ := cmd.Flags().GetString("args"); v != "" {
 			p["args"] = v
 		}
-		if v, _ := cmd.Flags().GetBool("stop-on-entry"); v {
+		stopOnEntry, _ := cmd.Flags().GetBool("stop-on-entry")
+		if stopOnEntry {
 			p["stopOnEntry"] = "true"
 		}
 		if v, _ := cmd.Flags().GetString("launch-args"); v != "" {
@@ -261,8 +306,12 @@ var debugBreakpointCmd = &cobra.Command{
 	Short: "Set breakpoints in a file",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		file, err := filepath.Abs(args[0])
+		if err != nil {
+			return err
+		}
 		p := map[string]string{
-			"file":  args[0],
+			"file":  file,
 			"lines": args[1],
 		}
 		if v, _ := cmd.Flags().GetString("label"); v != "" {
@@ -442,6 +491,18 @@ var debugDisconnectCmd = &cobra.Command{
 	},
 }
 
+var debugRestartCmd = &cobra.Command{
+	Use:   "restart",
+	Short: "Restart the debug session",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		p := map[string]string{}
+		if v, _ := cmd.Flags().GetString("label"); v != "" {
+			p["label"] = v
+		}
+		return sendDebug("restart", p)
+	},
+}
+
 var debugListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List debug sessions",
@@ -457,10 +518,9 @@ func init() {
 	debugLaunchCmd.Flags().String("label", "", "Debug session label")
 	debugLaunchCmd.Flags().String("adapter", "", "Debug adapter command (e.g. 'dlv dap')")
 	debugLaunchCmd.Flags().String("port", "", "Adapter TCP port (if adapter uses TCP)")
-	debugLaunchCmd.Flags().String("program", "", "Program to debug")
 	debugLaunchCmd.Flags().String("cwd", "", "Working directory")
 	debugLaunchCmd.Flags().String("args", "", "Program arguments (JSON array)")
-	debugLaunchCmd.Flags().Bool("stop-on-entry", false, "Stop on entry point")
+	debugLaunchCmd.Flags().Bool("stop-on-entry", true, "Stop on entry point (default true, use --stop-on-entry=false to disable)")
 	debugLaunchCmd.Flags().String("launch-args", "", "Additional launch arguments (JSON object)")
 
 	// Attach flags
@@ -478,7 +538,7 @@ func init() {
 	for _, cmd := range []*cobra.Command{
 		debugContinueCmd, debugNextCmd, debugStepInCmd, debugStepOutCmd,
 		debugPauseCmd, debugStackTraceCmd, debugScopesCmd, debugVariablesCmd,
-		debugEvalCmd, debugThreadsCmd, debugEventsCmd, debugDisconnectCmd,
+		debugEvalCmd, debugThreadsCmd, debugEventsCmd, debugRestartCmd, debugDisconnectCmd,
 	} {
 		cmd.Flags().String("label", "", "Debug session label")
 	}
@@ -495,7 +555,7 @@ func init() {
 		debugLaunchCmd, debugAttachCmd, debugBreakpointCmd,
 		debugContinueCmd, debugNextCmd, debugStepInCmd, debugStepOutCmd, debugPauseCmd,
 		debugStackTraceCmd, debugScopesCmd, debugVariablesCmd, debugEvalCmd,
-		debugThreadsCmd, debugEventsCmd, debugDisconnectCmd, debugListCmd,
+		debugThreadsCmd, debugEventsCmd, debugRestartCmd, debugDisconnectCmd, debugListCmd,
 	)
 	rootCmd.AddCommand(debugCmd)
 }

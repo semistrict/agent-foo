@@ -3,10 +3,12 @@ package debugger
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,8 +37,27 @@ type Session struct {
 	// Set after initialize handshake
 	capabilities *dap.Capabilities
 
-	// Last stopped state
+	// Current state: "running", "stopped", "exited"
+	state           string
 	stoppedThreadId int
+
+	// Original launch params for restart
+	launchParams paramMap
+
+	// adapterAddr is the TCP address of the adapter (host:port) for creating
+	// child sessions in response to startDebugging reverse requests.
+	adapterAddr string
+
+	// child holds the active child session created by startDebugging.
+	// When set, all DAP commands are routed through the child.
+	child *Session
+
+	// childReady is closed when a child session is fully initialized.
+	childReady chan struct{}
+
+	// parent, if set, is the parent session. Events from child sessions
+	// are forwarded to the parent's event store.
+	parent *Session
 }
 
 // Handler manages debug sessions keyed by label.
@@ -81,6 +102,8 @@ func (h *Handler) HandleRequest(req *protocol.Request) *protocol.Response {
 		return h.doEvaluate(p)
 	case "threads":
 		return h.doThreads(p)
+	case "restart":
+		return h.doRestart(p)
 	case "disconnect":
 		return h.doDisconnect(p)
 	case "events":
@@ -108,18 +131,54 @@ func (h *Handler) doLaunch(p paramMap) *protocol.Response {
 	}
 	h.mu.Unlock()
 
-	// adapter: the debug adapter command (e.g. "dlv dap", "debugpy-adapter")
+	// adapter: either a known name (e.g. "js-debug") or a shell command (e.g. "dlv dap").
+	// Auto-detected from --program extension if not specified.
 	adapter := p["adapter"]
 	if adapter == "" {
-		return errResp("adapter is required (e.g. 'dlv dap')")
+		adapter = adapterForProgram(p["program"])
+	}
+	if adapter == "" {
+		ext := filepath.Ext(p["program"])
+		if ext != "" {
+			return errResp("no debug adapter for %s files (use --adapter to specify one)", ext)
+		}
+		return errResp("adapter is required (use --adapter to specify one)")
 	}
 
-	parts := strings.Fields(adapter)
+	// Check for known/auto-downloadable adapters
+	resolved, err := resolveAdapter(adapter)
+	if err != nil {
+		return errResp("%v", err)
+	}
+
+	var parts []string
+	useTCP := p["port"] != ""
+	if resolved != nil {
+		parts = resolved.Command
+		useTCP = resolved.TCP
+	} else {
+		parts = strings.Fields(adapter)
+	}
+
 	cmd := exec.Command(parts[0], parts[1:]...)
 	cmd.Env = os.Environ()
 
 	// Use TCP: adapter listens on a port
-	if port := p["port"]; port != "" {
+	if useTCP {
+		port := p["port"]
+		if port == "" {
+			// Pick a free port
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				return errResp("find free port: %v", err)
+			}
+			port = fmt.Sprintf("%d", l.Addr().(*net.TCPAddr).Port)
+			l.Close()
+		}
+		// Append port and host args for resolved adapters (e.g. dapDebugServer.js <port> <host>)
+		if resolved != nil {
+			cmd.Args = append(cmd.Args, port, "127.0.0.1")
+		}
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {
@@ -135,19 +194,64 @@ func (h *Handler) doLaunch(p paramMap) *protocol.Response {
 		}
 
 		sess := h.newSession(label, conn, cmd)
+		sess.launchParams = p
+		sess.adapterAddr = "127.0.0.1:" + port
+		sess.childReady = make(chan struct{})
 		if err := sess.initialize(); err != nil {
 			sess.close()
 			return errResp("initialize: %v", err)
 		}
 
-		// DAP handshake: launch → initialized event → configurationDone
-		if err := sess.sendLaunch(p); err != nil {
+		// Merge default launch args from resolved adapter
+		if resolved != nil && resolved.DefaultLaunchArgs != nil {
+			mergeDefaultLaunchArgs(p, resolved.DefaultLaunchArgs)
+		}
+
+		// DAP handshake: dapDebugServer.js (js-debug) blocks the launch
+		// response until configurationDone is received. So we send the
+		// launch request (non-blocking), then configurationDone, then
+		// read the launch response.
+		if err := sess.fireLaunch(p); err != nil {
 			sess.close()
 			return errResp("launch: %v", err)
 		}
 		if err := sess.configurationDone(); err != nil {
 			sess.close()
 			return errResp("configurationDone: %v", err)
+		}
+		if resp, err := sess.receiveResponse(); err != nil {
+			sess.close()
+			return errResp("launch response: %v", err)
+		} else {
+			_ = resp
+		}
+
+		// Wait for child session to be established (startDebugging)
+		select {
+		case <-sess.childReady:
+		case <-time.After(10 * time.Second):
+			sess.close()
+			return errResp("timeout waiting for child debug session")
+		}
+
+		// If stopOnEntry, wait for the debuggee to actually stop before returning.
+		if p["stopOnEntry"] == "true" {
+			if stopped := sess.waitForStopped(0, 10*time.Second); stopped != nil {
+				h.mu.Lock()
+				h.sessions[label] = sess
+				h.mu.Unlock()
+
+				result := map[string]any{
+					"label":    label,
+					"status":   "stopped",
+					"reason":   stopped.Body.Reason,
+					"threadId": stopped.Body.ThreadId,
+				}
+				if frames := sess.fetchStackTrace(stopped.Body.ThreadId, 5); len(frames) > 0 {
+					result["stackTrace"] = frames
+				}
+				return dataResp(result)
+			}
 		}
 
 		h.mu.Lock()
@@ -185,14 +289,51 @@ func (h *Handler) doLaunch(p paramMap) *protocol.Response {
 	}
 
 	sess := h.newSession(label, conn, cmd)
+	sess.launchParams = p
 	if err := sess.initialize(); err != nil {
 		sess.close()
 		return errResp("initialize: %v", err)
 	}
 
-	if err := sess.sendLaunch(p); err != nil {
+	// Merge default launch args from resolved adapter
+	if resolved != nil && resolved.DefaultLaunchArgs != nil {
+		mergeDefaultLaunchArgs(p, resolved.DefaultLaunchArgs)
+	}
+
+	if err := sess.fireLaunch(p); err != nil {
 		sess.close()
 		return errResp("launch: %v", err)
+	}
+	if err := sess.configurationDone(); err != nil {
+		sess.close()
+		return errResp("configurationDone: %v", err)
+	}
+	if resp, err := sess.receiveResponse(); err != nil {
+		sess.close()
+		return errResp("launch response: %v", err)
+	} else if lr, ok := resp.(*dap.LaunchResponse); ok && !lr.Response.Success {
+		sess.close()
+		return errResp("launch failed: %s", lr.Message)
+	}
+
+	// If stopOnEntry, wait for the debuggee to actually stop before returning.
+	if p["stopOnEntry"] == "true" {
+		if stopped := sess.waitForStopped(0, 10*time.Second); stopped != nil {
+			h.mu.Lock()
+			h.sessions[label] = sess
+			h.mu.Unlock()
+
+			result := map[string]any{
+				"label":    label,
+				"status":   "stopped",
+				"reason":   stopped.Body.Reason,
+				"threadId": stopped.Body.ThreadId,
+			}
+			if frames := sess.fetchStackTrace(stopped.Body.ThreadId, 5); len(frames) > 0 {
+				result["stackTrace"] = frames
+			}
+			return dataResp(result)
+		}
 	}
 
 	h.mu.Lock()
@@ -290,10 +431,7 @@ func (h *Handler) doSetBreakpoints(p paramMap) *protocol.Response {
 		bps = append(bps, bp)
 	}
 
-	sess.mu.Lock()
-	sess.seq++
-	seq := sess.seq
-	sess.mu.Unlock()
+	seq := sess.nextSeq()
 
 	req := &dap.SetBreakpointsRequest{
 		Request: newRequest(seq, "setBreakpoints"),
@@ -340,10 +478,7 @@ func (h *Handler) doControl(p paramMap, action string) *protocol.Response {
 		threadId, _ = strconv.Atoi(v)
 	}
 
-	sess.mu.Lock()
-	sess.seq++
-	seq := sess.seq
-	sess.mu.Unlock()
+	seq := sess.nextSeq()
 
 	var req dap.Message
 	switch action {
@@ -379,13 +514,14 @@ func (h *Handler) doControl(p paramMap, action string) *protocol.Response {
 	eventsBefore := len(sess.events)
 	sess.eventsMu.Unlock()
 
-	// Send the control request
-	if err := sess.send(req); err != nil {
+	// Send the control request (routed through active/child session)
+	a := sess.active()
+	if err := dap.WriteProtocolMessage(a.conn, req); err != nil {
 		return errResp("send %s: %v", action, err)
 	}
 
-	// Read the response
-	resp, err := sess.receiveResponse()
+	// Read the response from the active session
+	resp, err := a.receiveResponse()
 	if err != nil {
 		return errResp("receive %s response: %v", action, err)
 	}
@@ -405,7 +541,18 @@ func (h *Handler) doControl(p paramMap, action string) *protocol.Response {
 			}
 			return dataResp(result)
 		}
-		// If no stopped event, the program may still be running
+		// Check if program exited
+		sess.eventsMu.Lock()
+		for i := eventsBefore; i < len(sess.events); i++ {
+			if e, ok := sess.events[i].(*dap.ExitedEvent); ok {
+				sess.eventsMu.Unlock()
+				return dataResp(map[string]any{
+					"status":   "exited",
+					"exitCode": e.Body.ExitCode,
+				})
+			}
+		}
+		sess.eventsMu.Unlock()
 		return respToResult(resp)
 	}
 
@@ -442,11 +589,15 @@ func (h *Handler) doScopes(p paramMap) *protocol.Response {
 	}
 
 	frameId, _ := strconv.Atoi(p["frame"])
+	if p["frame"] == "" {
+		if frames := sess.fetchStackTrace(sess.stoppedThreadId, 1); len(frames) > 0 {
+			if id, ok := frames[0]["id"].(int); ok {
+				frameId = id
+			}
+		}
+	}
 
-	sess.mu.Lock()
-	sess.seq++
-	seq := sess.seq
-	sess.mu.Unlock()
+	seq := sess.nextSeq()
 
 	req := &dap.ScopesRequest{
 		Request:   newRequest(seq, "scopes"),
@@ -483,10 +634,7 @@ func (h *Handler) doVariables(p paramMap) *protocol.Response {
 		return errResp("ref (variablesReference) is required")
 	}
 
-	sess.mu.Lock()
-	sess.seq++
-	seq := sess.seq
-	sess.mu.Unlock()
+	seq := sess.nextSeq()
 
 	req := &dap.VariablesRequest{
 		Request:   newRequest(seq, "variables"),
@@ -530,16 +678,21 @@ func (h *Handler) doEvaluate(p paramMap) *protocol.Response {
 	}
 
 	frameId, _ := strconv.Atoi(p["frame"])
+	// Auto-resolve frame ID from top of stack if not specified
+	if p["frame"] == "" {
+		if frames := sess.fetchStackTrace(sess.stoppedThreadId, 1); len(frames) > 0 {
+			if id, ok := frames[0]["id"].(int); ok {
+				frameId = id
+			}
+		}
+	}
 
 	context := p["context"]
 	if context == "" {
 		context = "repl"
 	}
 
-	sess.mu.Lock()
-	sess.seq++
-	seq := sess.seq
-	sess.mu.Unlock()
+	seq := sess.nextSeq()
 
 	req := &dap.EvaluateRequest{
 		Request: newRequest(seq, "evaluate"),
@@ -576,10 +729,7 @@ func (h *Handler) doThreads(p paramMap) *protocol.Response {
 		return errResp("%v", err)
 	}
 
-	sess.mu.Lock()
-	sess.seq++
-	seq := sess.seq
-	sess.mu.Unlock()
+	seq := sess.nextSeq()
 
 	req := &dap.ThreadsRequest{
 		Request: newRequest(seq, "threads"),
@@ -650,6 +800,39 @@ func (h *Handler) doEvents(p paramMap) *protocol.Response {
 	return dataResp(result)
 }
 
+func (h *Handler) doRestart(p paramMap) *protocol.Response {
+	sess, err := h.getSession(p)
+	if err != nil {
+		return errResp("%v", err)
+	}
+
+	launchParams := sess.launchParams
+	if launchParams == nil {
+		return errResp("session has no launch params (was it attached?)")
+	}
+
+	label := p["label"]
+	if label == "" {
+		label = "default"
+	}
+
+	// Disconnect the old session
+	seq := sess.nextSeq()
+	req := &dap.DisconnectRequest{
+		Request:   newRequest(seq, "disconnect"),
+		Arguments: &dap.DisconnectArguments{TerminateDebuggee: true},
+	}
+	sess.send(req)
+	sess.close()
+
+	h.mu.Lock()
+	delete(h.sessions, label)
+	h.mu.Unlock()
+
+	// Relaunch with the same params
+	return h.doLaunch(launchParams)
+}
+
 func (h *Handler) doDisconnect(p paramMap) *protocol.Response {
 	sess, err := h.getSession(p)
 	if err != nil {
@@ -663,10 +846,7 @@ func (h *Handler) doDisconnect(p paramMap) *protocol.Response {
 
 	terminate := p["terminate"] != "false"
 
-	sess.mu.Lock()
-	sess.seq++
-	seq := sess.seq
-	sess.mu.Unlock()
+	seq := sess.nextSeq()
 
 	req := &dap.DisconnectRequest{
 		Request: newRequest(seq, "disconnect"),
@@ -695,7 +875,14 @@ func (h *Handler) doList() *protocol.Response {
 		case <-sess.done:
 			item["status"] = "closed"
 		default:
-			item["status"] = "connected"
+			sess.eventsMu.Lock()
+			state := sess.state
+			sess.eventsMu.Unlock()
+			if state != "" {
+				item["status"] = state
+			} else {
+				item["status"] = "connected"
+			}
 		}
 		items = append(items, item)
 	}
@@ -819,7 +1006,8 @@ func (s *Session) configurationDone() error {
 	return err
 }
 
-func (s *Session) sendLaunch(p paramMap) error {
+// buildLaunchRequest constructs the DAP launch request from params.
+func (s *Session) buildLaunchRequest(p paramMap) *dap.LaunchRequest {
 	s.mu.Lock()
 	s.seq++
 	seq := s.seq
@@ -853,13 +1041,23 @@ func (s *Session) sendLaunch(p paramMap) error {
 
 	argsJSON, _ := json.Marshal(args)
 
-	req := &dap.LaunchRequest{
+	return &dap.LaunchRequest{
 		Request:   newRequest(seq, "launch"),
 		Arguments: argsJSON,
 	}
+}
 
+// sendLaunch sends a launch request and waits for the response.
+func (s *Session) sendLaunch(p paramMap) error {
+	req := s.buildLaunchRequest(p)
 	_, err := s.sendAndReceive(req)
 	return err
+}
+
+// fireLaunch sends a launch request without waiting for the response.
+func (s *Session) fireLaunch(p paramMap) error {
+	req := s.buildLaunchRequest(p)
+	return s.send(req)
 }
 
 func (s *Session) sendAttach(p paramMap) error {
@@ -893,15 +1091,36 @@ func (s *Session) sendAttach(p paramMap) error {
 	return err
 }
 
+// active returns the child session if one exists, otherwise self.
+// This ensures DAP commands are routed to the actual debug session
+// (not the parent orchestrator session used by dapDebugServer.js).
+func (s *Session) active() *Session {
+	if s.child != nil {
+		return s.child
+	}
+	return s
+}
+
+// nextSeq increments and returns the next sequence number on the active session.
+func (s *Session) nextSeq() int {
+	a := s.active()
+	a.mu.Lock()
+	a.seq++
+	seq := a.seq
+	a.mu.Unlock()
+	return seq
+}
+
 func (s *Session) send(msg dap.Message) error {
-	return dap.WriteProtocolMessage(s.conn, msg)
+	return dap.WriteProtocolMessage(s.active().conn, msg)
 }
 
 func (s *Session) sendAndReceive(msg dap.Message) (dap.Message, error) {
-	if err := s.send(msg); err != nil {
+	a := s.active()
+	if err := dap.WriteProtocolMessage(a.conn, msg); err != nil {
 		return nil, err
 	}
-	return s.receiveResponse()
+	return a.receiveResponse()
 }
 
 // receiveResponse waits for a response from the read loop.
@@ -929,30 +1148,143 @@ func (s *Session) receiveResponse() (dap.Message, error) {
 
 // readLoop is the single goroutine that reads all messages from the adapter.
 // Events are dispatched to the event store; responses go to the responses channel.
+// Reverse requests (like startDebugging) are handled inline.
 func (s *Session) readLoop() {
 	defer close(s.done)
 	defer close(s.responses)
 	for {
 		msg, err := dap.ReadProtocolMessage(s.r)
 		if err != nil {
+			// Skip unknown events/commands (e.g. debugpy's "debugpySockets")
+			var fieldErr *dap.DecodeProtocolMessageFieldError
+			if errors.As(err, &fieldErr) {
+				continue
+			}
 			return
 		}
 		if ev, ok := msg.(dap.EventMessage); ok {
 			s.handleEvent(ev)
+		} else if req, ok := msg.(*dap.StartDebuggingRequest); ok {
+			s.handleStartDebugging(req)
 		} else {
 			s.responses <- msg
 		}
 	}
 }
 
-func (s *Session) handleEvent(ev dap.EventMessage) {
-	s.eventsMu.Lock()
-	s.events = append(s.events, ev.(dap.Message))
-	// Track stopped thread
-	if stopped, ok := ev.(*dap.StoppedEvent); ok {
-		s.stoppedThreadId = stopped.Body.ThreadId
+// handleStartDebugging handles the reverse startDebugging request from the
+// adapter. It creates a new TCP connection to the adapter, initializes a
+// child Session, and stores it so subsequent commands route through it.
+func (s *Session) handleStartDebugging(req *dap.StartDebuggingRequest) {
+	go func() {
+		if s.adapterAddr == "" {
+			s.sendReverseResponse(req.Seq, "startDebugging", false, "no adapter address for child session")
+			return
+		}
+
+		conn, err := net.Dial("tcp", s.adapterAddr)
+		if err != nil {
+			s.sendReverseResponse(req.Seq, "startDebugging", false, fmt.Sprintf("connect child: %v", err))
+			return
+		}
+
+		child := &Session{
+			label:     s.label + "/child",
+			conn:      conn,
+			r:         bufio.NewReader(conn),
+			done:      make(chan struct{}),
+			responses: make(chan dap.Message, 16),
+			parent:    s,
+		}
+		go child.readLoop()
+
+		// Initialize child
+		if err := child.initialize(); err != nil {
+			child.close()
+			s.sendReverseResponse(req.Seq, "startDebugging", false, fmt.Sprintf("init child: %v", err))
+			return
+		}
+
+		// Send launch/attach with the configuration from startDebugging
+		launchArgs, _ := json.Marshal(req.Arguments.Configuration)
+
+		child.mu.Lock()
+		child.seq++
+		seq := child.seq
+		child.mu.Unlock()
+
+		if req.Arguments.Request == "attach" {
+			child.send(&dap.AttachRequest{
+				Request:   newRequest(seq, "attach"),
+				Arguments: launchArgs,
+			})
+		} else {
+			child.send(&dap.LaunchRequest{
+				Request:   newRequest(seq, "launch"),
+				Arguments: launchArgs,
+			})
+		}
+
+		// configurationDone on child (waits for initialized event, then sends)
+		if err := child.configurationDone(); err != nil {
+			child.close()
+			s.sendReverseResponse(req.Seq, "startDebugging", false, fmt.Sprintf("child configDone: %v", err))
+			return
+		}
+
+		// Read the launch/attach response
+		if _, err := child.receiveResponse(); err != nil {
+			child.close()
+			s.sendReverseResponse(req.Seq, "startDebugging", false, fmt.Sprintf("child launch: %v", err))
+			return
+		}
+
+		// Store child — subsequent commands route through it
+		s.child = child
+		if s.childReady != nil {
+			close(s.childReady)
+		}
+
+		s.sendReverseResponse(req.Seq, "startDebugging", true, "")
+	}()
+}
+
+func (s *Session) sendReverseResponse(reqSeq int, command string, success bool, errMsg string) {
+	s.mu.Lock()
+	s.seq++
+	seq := s.seq
+	s.mu.Unlock()
+
+	resp := &dap.StartDebuggingResponse{
+		Response: dap.Response{
+			ProtocolMessage: dap.ProtocolMessage{Seq: seq, Type: "response"},
+			Command:         command,
+			RequestSeq:      reqSeq,
+			Success:         success,
+			Message:         errMsg,
+		},
 	}
-	s.eventsMu.Unlock()
+	s.send(resp)
+}
+
+func (s *Session) handleEvent(ev dap.EventMessage) {
+	// Forward events to parent session if this is a child
+	target := s
+	if s.parent != nil {
+		target = s.parent
+	}
+	target.eventsMu.Lock()
+	target.events = append(target.events, ev.(dap.Message))
+	switch e := ev.(type) {
+	case *dap.StoppedEvent:
+		target.state = "stopped"
+		target.stoppedThreadId = e.Body.ThreadId
+	case *dap.ContinuedEvent:
+		target.state = "running"
+	case *dap.TerminatedEvent, *dap.ExitedEvent:
+		target.state = "exited"
+	}
+	target.eventsMu.Unlock()
 }
 
 // fetchStackTrace fetches the top N frames for a thread. Returns nil on error.
@@ -1005,6 +1337,12 @@ func (s *Session) waitForStopped(startIdx int, timeout time.Duration) *dap.Stopp
 				s.eventsMu.Unlock()
 				return stopped
 			}
+			// Program ended — no point waiting for a stop
+			switch s.events[i].(type) {
+			case *dap.TerminatedEvent, *dap.ExitedEvent:
+				s.eventsMu.Unlock()
+				return nil
+			}
 		}
 		seen = len(s.events)
 		s.eventsMu.Unlock()
@@ -1048,6 +1386,22 @@ func parseParams(raw json.RawMessage) paramMap {
 		json.Unmarshal(raw, &m)
 	}
 	return m
+}
+
+// mergeDefaultLaunchArgs injects default launch args into the launchArgs param.
+// User-supplied keys take priority over defaults.
+func mergeDefaultLaunchArgs(p paramMap, defaults map[string]any) {
+	existing := map[string]any{}
+	if v := p["launchArgs"]; v != "" {
+		json.Unmarshal([]byte(v), &existing)
+	}
+	for k, v := range defaults {
+		if _, ok := existing[k]; !ok {
+			existing[k] = v
+		}
+	}
+	data, _ := json.Marshal(existing)
+	p["launchArgs"] = string(data)
 }
 
 func newRequest(seq int, command string) dap.Request {

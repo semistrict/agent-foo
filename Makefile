@@ -6,6 +6,7 @@ JS_DIR := internal/browser/js/vendor
 
 build:
 	go build -o bin/af ./cmd/af
+	go install ./cmd/af
 
 test: build
 	go test -v -count=1 ./...
